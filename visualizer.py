@@ -9,7 +9,7 @@ tremer de verdade (e, se não der para mover a janela, treme o conteúdo).
     python visualizer.py --demo     # sinal sintético, sem precisar tocar nada
     python visualizer.py --list-devices
 
-Teclas:  M = menu   ↑↓ = sensibilidade   ←→ = nº de barras   P = paleta
+Teclas:  M = menu   Cima/Baixo = sensibilidade   Esq/Dir = nº de barras   P = paleta
          S = tremor   D = trocar entrada   Q = sair
 """
 from __future__ import annotations
