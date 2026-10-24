@@ -4,7 +4,14 @@ Terminal audio visualizer. The bars have a color fade and, when a strong bass hi
 
 ![screenshot](docs/screenshot.png)
 
-## Usage
+## Download
+
+Grab the binary for your system from the [Releases](../../releases) page, no Python needed:
+
+- Windows: `audio-visualizer-windows-x64.exe` (run it from Windows Terminal or just double-click)
+- Linux: `audio-visualizer-linux-x64` (`chmod +x` it first; still needs `pactl`/`parec`, i.e. `pulseaudio-utils`)
+
+## Usage (from source)
 
 ```bash
 # Windows

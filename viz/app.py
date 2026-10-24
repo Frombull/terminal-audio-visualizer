@@ -24,7 +24,14 @@ else:
 # Settings
 # --------------------------------------------------------------------------- #
 
-SETTINGS_FILE = Path(__file__).resolve().parent.parent / "settings.json"
+def _settings_path() -> Path:
+    if getattr(sys, "frozen", False):  # packaged exe: the bundle dir is temporary, use the user config dir
+        base = os.environ.get("APPDATA") or os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        return Path(base) / "audio-visualizer" / "settings.json"
+    return Path(__file__).resolve().parent.parent / "settings.json"
+
+
+SETTINGS_FILE = _settings_path()
 
 
 @dataclass
@@ -59,6 +66,7 @@ class Settings:
 
     def save(self) -> None:
         try:
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_FILE.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
         except OSError:
             pass

@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            asset: audio-visualizer-windows-x64.exe
+          # oldest runner on purpose: the binary runs on any glibc at least as new as this one
+          - os: ubuntu-22.04
+            asset: audio-visualizer-linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: pyinstaller --onefile --console --name audio-visualizer visualizer.py
+      - name: Rename (Windows)
+        if: runner.os == 'Windows'
+        run: Move-Item dist/audio-visualizer.exe dist/${{ matrix.asset }}
+      - name: Rename (Linux)
+        if: runner.os == 'Linux'
+        run: mv dist/audio-visualizer dist/${{ matrix.asset }}
+      - name: Smoke test
+        run: dist/${{ matrix.asset }} --list-devices
+        continue-on-error: true  # CI runners have no audio device
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
