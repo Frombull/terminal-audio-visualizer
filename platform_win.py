@@ -1,4 +1,4 @@
-"""Backend do Windows: loopback/microfone via WASAPI, tremor via user32, teclado via msvcrt."""
+"""Windows backend: loopback/microphone through WASAPI, shake through user32, keys through msvcrt."""
 from __future__ import annotations
 
 import ctypes
@@ -15,7 +15,7 @@ from audio_base import AudioBase, Device
 try:
     import pyaudiowpatch as pyaudio
 except ImportError:  # pragma: no cover
-    sys.exit("Dependências ausentes. Rode:  pip install -r requirements.txt")
+    sys.exit("Missing dependencies. Run:  pip install -r requirements.txt")
 
 
 class AudioInput(AudioBase):
@@ -53,7 +53,7 @@ class AudioInput(AudioBase):
     def open(self, dev: Device | None) -> None:
         self.close()
         if dev is None:
-            self.error = "nenhum dispositivo de entrada encontrado"
+            self.error = "no input device found"
             return
         ch = dev.channels
 
@@ -72,7 +72,7 @@ class AudioInput(AudioBase):
             self.rate = dev.rate
             self.current = dev
             self.error = ""
-        except Exception as e:  # noqa: BLE001 - mostramos o erro na UI
+        except Exception as e:  # noqa: BLE001 - the error is shown in the UI
             self.stream = None
             self.current = None
             self.error = f"{dev.label}: {e}"
@@ -92,7 +92,7 @@ class AudioInput(AudioBase):
 
 
 # --------------------------------------------------------------------------- #
-# Tremor da janela do terminal
+# Terminal window shake
 # --------------------------------------------------------------------------- #
 
 
@@ -122,7 +122,7 @@ class WindowShaker:
             fn.argtypes = [H]
         hwnd = k.GetConsoleWindow()
         if hwnd:
-            owner = self.u.GetWindow(hwnd, 4)  # GW_OWNER: no Windows Terminal é a janela real
+            owner = self.u.GetWindow(hwnd, 4)  # GW_OWNER: in Windows Terminal this is the real window
             hwnd = owner or hwnd
         self.hwnd = hwnd
         self.base: tuple[int, int] | None = None
@@ -147,7 +147,7 @@ class WindowShaker:
     def move(self, dx: int, dy: int) -> None:
         cur = self._pos()
         if self.last is None or cur != self.last:
-            self.base = cur  # primeira vez, ou o usuário arrastou a janela
+            self.base = cur  # first time, or the user dragged the window
         bx, by = self.base
         self.u.SetWindowPos(self.hwnd, None, bx + dx, by + dy, 0, 0,
                             self.SWP_NOSIZE | self.SWP_NOZORDER | self.SWP_NOACTIVATE)
@@ -159,12 +159,12 @@ class WindowShaker:
 
 
 # --------------------------------------------------------------------------- #
-# Terminal e teclado
+# Terminal and keyboard
 # --------------------------------------------------------------------------- #
 
 
 def setup_terminal() -> Callable[[], None] | None:
-    """Liga o processamento de sequências VT. Devolve a função que restaura, ou None se não der."""
+    """Turns on VT sequence processing. Returns the restore function, or None if it fails."""
     k = ctypes.windll.kernel32
     h = k.GetStdHandle(-11)
     mode = wintypes.DWORD()

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Visualizador de áudio para o terminal (Windows e Linux).
+"""Terminal audio visualizer (Windows and Linux).
 
-Captura o som que está tocando no PC (loopback WASAPI no Windows, monitor do
-PulseAudio/PipeWire no Linux) ou um microfone, mostra
-barras com fade de cor e, quando bate um grave forte, faz a janela do terminal
-tremer de verdade (e, se não der para mover a janela, treme o conteúdo).
+Captures what is playing on your PC (WASAPI loopback on Windows, PulseAudio/PipeWire
+monitor on Linux) or a microphone and draws color-faded bars. When a strong bass hit
+lands, the terminal window shakes for real (or, if the window can't be moved, the
+content shakes instead).
 
-    python visualizer.py            # usa a saída padrão (o que você está ouvindo)
-    python visualizer.py --demo     # sinal sintético, sem precisar tocar nada
+    python visualizer.py            # default output (what you are listening to)
+    python visualizer.py --demo     # synthetic signal, nothing needs to play
     python visualizer.py --list-devices
 
-Teclas:  M = menu   Cima/Baixo = sensibilidade   Esq/Dir = nº de barras   P = paleta
-         S = tremor   D = trocar entrada   Q = sair
+Keys:  M = menu   Up/Down = sensitivity   Left/Right = bar count   P = palette
+       S = shake   F = effects   D = switch input   Q = quit
 """
 from __future__ import annotations
 
@@ -38,13 +38,13 @@ SETTINGS_FILE = Path(__file__).with_name("settings.json")
 ESC = "\x1b"
 
 # --------------------------------------------------------------------------- #
-# Configurações
+# Settings
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
 class Settings:
-    device: str = ""            # rótulo do dispositivo ("" = saída padrão)
+    device: str = ""            # device label ("" = default output)
     sensitivity: float = 1.0
     auto_gain: bool = True
     bars: int = 48
@@ -79,7 +79,7 @@ class Settings:
             pass
 
 
-# (stops, mistura horizontal, brilho na base)
+# (stops, horizontal mix, brightness at the base)
 PALETTES: dict[str, tuple[list[tuple[float, tuple[int, int, int]]], float, float]] = {
     "neon": ([(0, (70, 30, 210)), (0.5, (255, 40, 190)), (1, (0, 235, 255))], 0.25, 0.6),
     "fire": ([(0, (110, 0, 0)), (0.4, (255, 60, 0)), (0.75, (255, 190, 0)), (1, (255, 255, 190))], 0.0, 0.7),
@@ -102,16 +102,16 @@ def gradient(stops, t: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Entrada de áudio
+# Audio input
 # --------------------------------------------------------------------------- #
 
 class DemoSource:
-    """Sinal sintético (kick + chimbal + acordes) para testar sem tocar nada."""
+    """Synthetic signal (kick + hi-hat + chords) to try it without playing anything."""
 
     rate = 48000
     devices: list[Device] = []
     error = ""
-    label = "Demo (sinal sintético)"
+    label = "Demo"
     current = None
 
     def __init__(self, clock=time.perf_counter) -> None:
@@ -141,11 +141,11 @@ class DemoSource:
 
 
 # --------------------------------------------------------------------------- #
-# Análise (FFT -> barras) e detecção de grave
+# Analysis (FFT -> bars) and bass detection
 # --------------------------------------------------------------------------- #
 
-DB_RANGE = 50.0       # faixa dinâmica exibida
-MANUAL_REF_DB = -14.0  # referência de topo quando o ganho automático está desligado
+DB_RANGE = 50.0       # displayed dynamic range
+MANUAL_REF_DB = -14.0  # top reference when auto gain is off
 
 
 class Analyzer:
@@ -171,7 +171,7 @@ class Analyzer:
         self.red[0::2], self.red[1::2] = s, e
         self.narrow = (khi - klo) < 1.5
         self.centers = np.sqrt(edges[:-1] * edges[1:])
-        self.tilt = 3.0 * np.log2(self.centers / 60.0)  # compensa a queda natural dos agudos
+        self.tilt = 3.0 * np.log2(self.centers / 60.0)  # compensates the natural treble roll-off
         self.b0 = max(1, int(30 / bin_hz))
         self.b1 = max(self.b0 + 2, int(150 / bin_hz))
 
@@ -191,14 +191,14 @@ class Analyzer:
             ref = self.ref_db
         else:
             ref = MANUAL_REF_DB
+        bass = max(0.0, (bass_db - ref + DB_RANGE) / DB_RANGE)  # the shake ignores the bar sensitivity
         ref -= sens_db
         lv = np.clip((db - ref + DB_RANGE) / DB_RANGE, 0.0, 1.0)
-        bass = max(0.0, (bass_db - ref + DB_RANGE) / DB_RANGE)
         return lv, bass
 
 
 class BarState:
-    """Suavização (ataque rápido / queda lenta) e picos flutuantes."""
+    """Smoothing (fast attack / slow release) and floating peaks."""
 
     def __init__(self, n: int) -> None:
         self.v = np.zeros(n)
@@ -224,16 +224,16 @@ class BarState:
 
 
 class BassTracker:
-    """Detecta pancadas de grave (energia subindo acima da média recente)."""
+    """Detects bass hits (energy rising above the recent average)."""
 
     def __init__(self) -> None:
         self.avg = 0.0
-        self.env = 0.0    # intensidade do tremor (0..1)
-        self.flash = 0.0  # brilho extra nas barras
+        self.env = 0.0    # shake intensity (0..1)
+        self.flash = 0.0  # extra brightness on the bars
         self.level = 0.0
 
     def update(self, bass: float, sens: float, dt: float) -> None:
-        # média rápida: só a subida brusca (ataque) fica acima dela
+        # fast average: only a sudden rise (attack) stays above it
         excess = bass - self.avg
         self.avg += (bass - self.avg) * (1 - math.exp(-dt / 0.15))
         hit = 0.0
@@ -245,7 +245,7 @@ class BassTracker:
 
 
 # --------------------------------------------------------------------------- #
-# Renderização
+# Rendering
 # --------------------------------------------------------------------------- #
 
 BG = np.array([9, 9, 16])
@@ -263,14 +263,14 @@ def bgc(c) -> str:
     return f"{ESC}[48;2;{int(c[0])};{int(c[1])};{int(c[2])}m"
 
 
-BIT = np.array([[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]], np.uint8)  # [dx][dy] -> ponto braille
+BIT = np.array([[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]], np.uint8)  # [dx][dy] -> braille dot
 
 
 class Cosmos:
-    """Camada de efeitos em braille (2x4 pontos por célula): estrelas em warp,
-    faíscas que saem das barras e ondas de choque a cada pancada de grave."""
+    """Braille effects layer (2x4 dots per cell): warp stars, sparks flying off the
+    bars and shockwaves on every bass hit."""
 
-    GRAVITY = 140.0  # pontos/s²
+    GRAVITY = 140.0  # dots/s^2
 
     def __init__(self) -> None:
         self.rng = np.random.default_rng()
@@ -278,8 +278,8 @@ class Cosmos:
         self.aspect = 2.0
         self.x = self.y = self.z = np.zeros(0)
         self.warp = 0.0
-        self.sparks = np.zeros((0, 7))  # x, y, vx, vy, idade, vida, posição na paleta
-        self.rings: list[list[float]] = []  # [idade 0..1, força]
+        self.sparks = np.zeros((0, 7))  # x, y, vx, vy, age, life, palette position
+        self.rings: list[list[float]] = []  # [age 0..1, strength]
         self.last_spawn = 0.0
 
     def _spawn_stars(self, k: int, anywhere: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -350,7 +350,7 @@ class Cosmos:
         top = gradient(stops, np.array(0.9))
         if stars_on and len(self.z):
             f = np.linspace(0, 1, 5)[:, None]
-            zt = self.z + 0.004 + 0.075 * self.warp  # cauda do risco: mais longe = mais perto do centro
+            zt = self.z + 0.004 + 0.075 * self.warp  # streak tail: farther away = closer to the center
             zz = self.z[None, :] + (zt - self.z)[None, :] * f
             px = np.floor(W / 2 + self.x[None, :] / zz * (H / 2)).astype(int)
             py = np.floor(H / 2 + self.y[None, :] / zz * (H / 2)).astype(int)
@@ -460,7 +460,7 @@ class Renderer:
         bw, gap = self.bw, self.gap
 
         def blank_run(out: list[str], li: int, x0: int, w: int) -> None:
-            """Espaço vazio de [x0, x0+w) na linha li, com os pontos de efeito por cima."""
+            """Empty space [x0, x0+w) on line li, with the effect dots on top."""
             cur, end = x0, x0 + w
             for c, glyph, seq in fx.get(li, ()):
                 if c < cur or c >= end:
@@ -523,31 +523,31 @@ class Renderer:
 
 
 # --------------------------------------------------------------------------- #
-# Aplicação
+# Application
 # --------------------------------------------------------------------------- #
 
 ITEMS = [
-    dict(key="device", label="Entrada de áudio", kind="device"),
-    dict(key="sensitivity", label="Sensibilidade", kind="num", lo=0.1, hi=6.0, step=0.1, fmt="x{:.1f}"),
-    dict(key="auto_gain", label="Ganho automático", kind="bool"),
-    dict(key="bars", label="Nº de barras", kind="num", lo=4, hi=256, step=2, fmt="{:d}"),
-    dict(key="smoothing", label="Movimento suave", kind="num", lo=0, hi=10, step=1, fmt="{:d}"),
-    dict(key="palette", label="Cores (fade)", kind="choice", opts=list(PALETTES)),
-    dict(key="style", label="Estilo", kind="choice", opts=["bars", "mirror"],
-         names={"bars": "Barras", "mirror": "Espelhado"}),
-    dict(key="reflection", label="Reflexo", kind="bool"),
-    dict(key="peaks", label="Picos flutuantes", kind="bool"),
-    dict(key="fx", label="Efeitos cósmicos", kind="choice", opts=["all", "stars", "bursts", "off"],
-         names={"all": "Tudo", "stars": "Só estrelas", "bursts": "Só faíscas/ondas", "off": "Desligado"}),
-    dict(key="shake", label="Tremor da tela", kind="choice", opts=["auto", "window", "content", "off"],
-         names={"auto": "Automático", "window": "Janela", "content": "Conteúdo", "off": "Desligado"}),
-    dict(key="shake_strength", label="Força do tremor", kind="num", lo=0, hi=10, step=1, fmt="{:d}"),
-    dict(key="bass_sensitivity", label="Sensib. dos graves", kind="num", lo=0.3, hi=3.0, step=0.1, fmt="x{:.1f}"),
-    dict(key="fps", label="Quadros por segundo", kind="num", lo=15, hi=120, step=5, fmt="{:d}"),
+    dict(key="device", label="Audio input", kind="device"),
+    dict(key="sensitivity", label="Sensitivity", kind="num", lo=0.02, hi=8.0, mult=1.25, fmt="x{:.2f}"),
+    dict(key="auto_gain", label="Auto gain", kind="bool"),
+    dict(key="bars", label="Bar count", kind="num", lo=4, hi=256, step=2, fmt="{:d}"),
+    dict(key="smoothing", label="Smooth motion", kind="num", lo=0, hi=10, step=1, fmt="{:d}"),
+    dict(key="palette", label="Colors (fade)", kind="choice", opts=list(PALETTES)),
+    dict(key="style", label="Style", kind="choice", opts=["bars", "mirror"],
+         names={"bars": "Bars", "mirror": "Mirrored"}),
+    dict(key="reflection", label="Reflection", kind="bool"),
+    dict(key="peaks", label="Floating peaks", kind="bool"),
+    dict(key="fx", label="Cosmic effects", kind="choice", opts=["all", "stars", "bursts", "off"],
+         names={"all": "All", "stars": "Stars only", "bursts": "Sparks/rings only", "off": "Off"}),
+    dict(key="shake", label="Screen shake", kind="choice", opts=["auto", "window", "content", "off"],
+         names={"auto": "Automatic", "window": "Window", "content": "Content", "off": "Off"}),
+    dict(key="shake_strength", label="Shake strength", kind="num", lo=0, hi=10, step=1, fmt="{:d}"),
+    dict(key="bass_sensitivity", label="Bass sensitivity", kind="num", lo=0.3, hi=3.0, step=0.1, fmt="x{:.1f}"),
+    dict(key="fps", label="Frames per second", kind="num", lo=15, hi=120, step=5, fmt="{:d}"),
 ]
 
-HINTS = " M menu  ↑↓ sensibilidade  ←→ barras  P paleta  S tremor  F efeitos  D entrada  Q sair "
-MENU_HINTS = " ↑↓ item  ←→ ajusta  R restaura padrões  M/Enter/Esc fecha "
+HINTS = " M menu  Up/Down sensitivity  Left/Right bars  P palette  S shake  F effects  D input  Q quit "
+MENU_HINTS = " Up/Down item  Left/Right adjust  R reset defaults  M/Enter/Esc close "
 
 
 def term_size() -> tuple[int, int]:
@@ -579,7 +579,7 @@ class App:
         self.shake_state = "off"
         self.audio.open(self.audio.find(settings.device))
 
-    # ----- ajustes ---------------------------------------------------------
+    # ----- settings ---------------------------------------------------------
     def say(self, text: str) -> None:
         self.toast = (text, time.perf_counter() + 1.6)
 
@@ -591,7 +591,7 @@ class App:
         if item["kind"] == "device":
             return self.audio.label
         if item["kind"] == "bool":
-            return "ligado" if v else "desligado"
+            return "on" if v else "off"
         if item["kind"] == "choice":
             return item.get("names", {}).get(v, v)
         return item["fmt"].format(v)
@@ -604,9 +604,10 @@ class App:
             opts = item["opts"]
             setattr(s, k, opts[(opts.index(getattr(s, k)) + direction) % len(opts)])
         elif item["kind"] == "num":
-            v = getattr(s, k) + direction * item["step"]
+            cur = getattr(s, k)
+            v = cur * item["mult"] ** direction if "mult" in item else cur + direction * item["step"]
             v = min(max(v, item["lo"]), item["hi"])
-            setattr(s, k, int(round(v)) if isinstance(getattr(s, k), int) else round(v, 2))
+            setattr(s, k, int(round(v)) if isinstance(cur, int) else round(v, 3))
         elif item["kind"] == "device":
             devs = self.audio.devices
             if devs:
@@ -639,7 +640,7 @@ class App:
                     dev = self.s.device
                     self.s.__dict__.update(asdict(Settings(device=dev)))
                     self.touch()
-                    self.say("Padrões restaurados")
+                    self.say("Defaults restored")
             elif k in ("up", "+", "="):
                 self.adjust(self.item("sensitivity"), 1)
             elif k in ("down", "-", "_"):
@@ -657,13 +658,13 @@ class App:
             elif k == "d":
                 self.adjust(self.item("device"), 1)
 
-    # ----- tremor ----------------------------------------------------------
+    # ----- shake ----------------------------------------------------------
     def apply_shake(self) -> tuple[int, int]:
         s, env = self.s, self.bass.env
         amp = (env ** 1.3) * s.shake_strength / 10.0 if s.shake != "off" else 0.0
         use_window = s.shake in ("auto", "window") and self.shaker.usable()
-        self.shake_state = "janela" if use_window else (
-            "conteúdo" if s.shake in ("auto", "content") else ("sem janela" if s.shake == "window" else "off"))
+        self.shake_state = "window" if use_window else (
+            "content" if s.shake in ("auto", "content") else ("no window" if s.shake == "window" else "off"))
         if use_window:
             if amp > 0.02:
                 px = amp * 40
@@ -676,19 +677,19 @@ class App:
             return round(random.uniform(-1, 1) * amp * 2.5), round(random.uniform(-1, 1) * amp * 1.4)
         return 0, 0
 
-    # ----- desenho ---------------------------------------------------------
+    # ----- drawing ---------------------------------------------------------
     def title_bar(self, cols: int) -> str:
         title = " ♪ AUDIO VISUALIZER"
         left = "".join(fg(self.rend.title_color(i / (len(title) - 1))) + ch for i, ch in enumerate(title))
         meter_n = 10
         filled = int(round(min(1.0, self.bass.level) * meter_n))
-        right = f"graves {'▮' * filled}{'▯' * (meter_n - filled)}  {self.fps:3.0f} fps  tremor: {self.shake_state} "
+        right = f"bass {'▮' * filled}{'▯' * (meter_n - filled)}  {self.fps:3.0f} fps  shake: {self.shake_state} "
         room = cols - len(title) - len(right) - 3
-        if room < 8:  # terminal estreito: só o essencial
+        if room < 8:  # narrow terminal: essentials only
             right = f"{self.fps:3.0f} fps "
             room = max(0, cols - len(title) - len(right) - 3)
         dev = self.audio.label
-        dev = dev if len(dev) <= room else (dev[:room - 1] + "…" if room > 0 else "")
+        dev = dev if len(dev) <= room else (dev[:room - 1] + "~" if room > 0 else "")
         gap = max(0, room - len(dev))
         return (bgc(PANEL_BG) + left + fg((120, 120, 150)) + "  " + dev + " " * (gap + 1)
                 + fg((170, 170, 200)) + right + " " * 0)
@@ -710,11 +711,15 @@ class App:
             it = ITEMS[i]
             val = self.display(it)
             if it["kind"] == "num":
-                frac = (getattr(self.s, it["key"]) - it["lo"]) / (it["hi"] - it["lo"])
-                f = int(round(frac * 12))
+                v = getattr(self.s, it["key"])
+                if "mult" in it:  # logarithmic scale
+                    frac = math.log(v / it["lo"]) / math.log(it["hi"] / it["lo"])
+                else:
+                    frac = (v - it["lo"]) / (it["hi"] - it["lo"])
+                f = int(round(min(max(frac, 0.0), 1.0) * 12))
                 val = "█" * f + "░" * (12 - f) + "  " + val
             selected = i == self.sel
-            text = f" {'▶' if selected else ' '} {it['label']:<20}{'◀ ' if selected else '  '}{val}{' ▶' if selected else ''}"
+            text = f" {'>' if selected else ' '} {it['label']:<20}{'< ' if selected else '  '}{val}{' >' if selected else ''}"
             text = text[:cols].ljust(cols)
             if selected:
                 out.append(bgc(tuple(c * 0.35 for c in accent)) + fg((255, 255, 255)) + text)
@@ -726,7 +731,7 @@ class App:
         return min(len(ITEMS), max(3, rows - 2 - 8))
 
     def fx_frame(self, dt: float):
-        """Avança e desenha a camada cósmica; dispara faíscas/ondas nas pancadas de grave."""
+        """Advances and draws the cosmic layer; fires sparks/rings on bass hits."""
         mode, c, r, env = self.s.fx, self.cosmos, self.rend, self.bass.env
         if mode == "off":
             return None
@@ -757,7 +762,7 @@ class App:
         body = "".join(f"{ESC}[{i};1H{ln}" for i, ln in enumerate(lines, 1))
         return f"{ESC}[?2026h{body}{ESC}[0m{ESC}[?2026l"
 
-    # ----- loop principal --------------------------------------------------
+    # ----- main loop --------------------------------------------------
     def run(self) -> None:
         out = sys.stdout
         last = time.perf_counter()
@@ -776,7 +781,7 @@ class App:
                 self.size = (cols, rows)
                 out.write(f"{ESC}[0m{ESC}[2J")
             if cols < 30 or rows < 10:
-                out.write(f"{ESC}[2J{ESC}[Hterminal pequeno demais")
+                out.write(f"{ESC}[2J{ESC}[Hterminal too small")
                 out.flush()
                 time.sleep(0.1)
                 continue
@@ -800,16 +805,16 @@ class App:
 
 
 # --------------------------------------------------------------------------- #
-# Terminal / entrada do programa
+# Terminal / program entry
 # --------------------------------------------------------------------------- #
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Visualizador de áudio para o terminal")
-    ap.add_argument("--demo", action="store_true", help="usa um sinal sintético em vez de captura")
-    ap.add_argument("--list-devices", action="store_true", help="lista as entradas disponíveis")
-    ap.add_argument("--device", help="trecho do nome da entrada (ex.: 'Edifier' ou 'Mic')")
-    ap.add_argument("--reset", action="store_true", help="ignora as configurações salvas")
+    ap = argparse.ArgumentParser(description="Terminal audio visualizer")
+    ap.add_argument("--demo", action="store_true", help="use a synthetic signal instead of capturing audio")
+    ap.add_argument("--list-devices", action="store_true", help="list the available inputs")
+    ap.add_argument("--device", help="part of the input name (e.g. 'Speakers' or 'Mic')")
+    ap.add_argument("--reset", action="store_true", help="ignore the saved settings")
     args = ap.parse_args()
 
     settings = Settings() if args.reset else Settings.load()
@@ -817,7 +822,7 @@ def main() -> None:
 
     if args.list_devices:
         for dv in audio.devices:
-            print(f"{dv.label}  ({dv.rate} Hz, {dv.channels} canais)")
+            print(f"{dv.label}  ({dv.rate} Hz, {dv.channels} channels)")
         audio.shutdown()
         return
     if args.device and audio.devices:
@@ -828,7 +833,7 @@ def main() -> None:
     restore = setup_terminal() if sys.stdout.isatty() else None
     if restore is None:
         audio.shutdown()
-        sys.exit("Rode dentro de um terminal (no Windows, de preferência o Windows Terminal).")
+        sys.exit("Run this inside a terminal (on Windows, preferably Windows Terminal).")
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     app = None

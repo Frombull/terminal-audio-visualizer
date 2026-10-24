@@ -1,4 +1,4 @@
-"""Parte da entrada de áudio que independe do sistema operacional."""
+"""The part of the audio input that does not depend on the operating system."""
 from __future__ import annotations
 
 import threading
@@ -12,7 +12,7 @@ RING = 1 << 15
 
 @dataclass
 class Device:
-    index: int | str  # índice (Windows) ou nome da fonte (Linux/PulseAudio)
+    index: int | str  # index (Windows) or source name (Linux/PulseAudio)
     name: str
     loopback: bool
     rate: int
@@ -20,13 +20,13 @@ class Device:
 
     @property
     def label(self) -> str:
-        return ("Saída: " if self.loopback else "Mic: ") + self.name
+        return ("Output: " if self.loopback else "Mic: ") + self.name
 
 
 class AudioBase:
-    """Guarda os últimos samples (mono) num ring buffer preenchido por uma thread de captura.
+    """Keeps the latest (mono) samples in a ring buffer filled by a capture thread.
 
-    As subclasses preenchem `devices` e implementam `open`/`close`; a captura chama `_push`.
+    Subclasses fill `devices` and implement `open`/`close`; the capture side calls `_push`.
     """
 
     def __init__(self) -> None:
@@ -45,7 +45,7 @@ class AudioBase:
                 return dv
         return self.devices[0] if self.devices else None
 
-    def open(self, dev: Device | None) -> None:  # pragma: no cover - implementado nas subclasses
+    def open(self, dev: Device | None) -> None:  # pragma: no cover - implemented by subclasses
         raise NotImplementedError
 
     def close(self) -> None:  # pragma: no cover
@@ -73,11 +73,11 @@ class AudioBase:
 
     def latest(self, n: int) -> np.ndarray:
         with self.lock:
-            # sem callbacks (ex.: loopback do Windows em silêncio) = sem sinal
+            # no callbacks (e.g. Windows loopback while silent) means no signal
             if time.perf_counter() - self.last_data > 0.12:
                 return np.zeros(n, np.float32)
             return self.ring.take(np.arange(self.widx - n, self.widx), mode="wrap")
 
     @property
     def label(self) -> str:
-        return self.current.label if self.current else (self.error or "sem entrada")
+        return self.current.label if self.current else (self.error or "no input")

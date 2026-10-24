@@ -1,10 +1,10 @@
-"""Backend do Linux.
+"""Linux backend.
 
-- Áudio: `pactl` lista as fontes (inclui os "monitores" das saídas = o que você está ouvindo)
-  e `parec` entrega os samples. Funciona com PulseAudio e com PipeWire (pipewire-pulse).
-- Tremor: move a janela do terminal via Xlib (ctypes). Só em X11/XWayland; no Wayland puro
-  nenhum programa pode mover a própria janela, então o modo automático usa o tremor de conteúdo.
-- Teclado: termios em modo cbreak.
+- Audio: `pactl` lists the sources (including the "monitors" of the outputs, i.e. what you are
+  listening to) and `parec` delivers the samples. Works with PulseAudio and PipeWire (pipewire-pulse).
+- Shake: moves the terminal window through Xlib (ctypes). X11/XWayland only; on pure Wayland no
+  program can move its own window, so the automatic mode falls back to the content shake.
+- Keyboard: termios in cbreak mode.
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def _run(*cmd: str, timeout: float = 3.0) -> str:
 
 
 def _spec(spec: str) -> tuple[int, int]:
-    """'float32le 2ch 48000Hz' -> (taxa, canais)."""
+    """'float32le 2ch 48000Hz' -> (rate, channels)."""
     m = re.search(r"(\d+)ch\s+(\d+)Hz", spec or "")
     return (int(m.group(2)), int(m.group(1))) if m else (48000, 2)
 
@@ -59,7 +59,7 @@ class AudioInput(AudioBase):
             return ""
 
     def _sources(self) -> list[tuple[str, str, bool, int, int]]:
-        """(nome, descrição, é_monitor, taxa, canais) de cada fonte do servidor de som."""
+        """(name, description, is_monitor, rate, channels) of every source on the sound server."""
         try:
             out = []
             for s in json.loads(_run("pactl", "--format=json", "list", "sources")):
@@ -69,7 +69,7 @@ class AudioInput(AudioBase):
                 out.append((s["name"], s.get("description") or s["name"], monitor, rate, ch))
             return out
         except (ValueError, KeyError, subprocess.CalledProcessError):
-            pass  # pactl antigo, sem --format=json
+            pass  # old pactl without --format=json
         out = []
         for line in _run("pactl", "list", "short", "sources").splitlines():
             cols = line.split("\t")
@@ -82,10 +82,10 @@ class AudioInput(AudioBase):
         try:
             sources = self._sources()
         except FileNotFoundError:
-            self.enum_error = "pactl não encontrado (instale pulseaudio-utils ou pipewire-pulse)"
+            self.enum_error = "pactl not found (install pulseaudio-utils or pipewire-pulse)"
             return []
         except (OSError, subprocess.SubprocessError) as e:
-            self.enum_error = f"não consegui falar com o servidor de som: {e}"
+            self.enum_error = f"could not talk to the sound server: {e}"
             return []
         default_monitor = self._default_sink() + ".monitor"
         devs = [Device(index=name, name=re.sub(r"^Monitor of ", "", desc), loopback=monitor,
@@ -97,14 +97,14 @@ class AudioInput(AudioBase):
     def open(self, dev: Device | None) -> None:
         self.close()
         if dev is None:
-            self.error = self.enum_error or "nenhum dispositivo de entrada encontrado"
+            self.error = self.enum_error or "no input device found"
             return
         cmd = ["parec", "-d", str(dev.index), "--format=float32le", f"--rate={dev.rate}",
                f"--channels={dev.channels}", "--latency-msec=20", "--client-name=audio-visualizer"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_ENV)
         except FileNotFoundError:
-            self.current, self.error = None, "parec não encontrado (instale pulseaudio-utils ou pipewire-pulse)"
+            self.current, self.error = None, "parec not found (install pulseaudio-utils or pipewire-pulse)"
             return
         self.proc, self.rate, self.current, self.error = proc, dev.rate, dev, ""
         self.thread = threading.Thread(target=self._reader, args=(proc, dev), daemon=True)
@@ -126,9 +126,9 @@ class AudioInput(AudioBase):
                 x = np.frombuffer(buf[:k], np.float32)
                 self._push(x.reshape(-1, ch).mean(axis=1) if ch > 1 else x)
                 buf = buf[k:]
-        if proc is self.proc:  # morreu sozinho (não fomos nós que fechamos)
+        if proc is self.proc:  # it died on its own (we did not close it)
             msg = proc.stderr.read().decode(errors="replace").strip().splitlines()
-            self.current, self.error = None, f"{dev.label}: {msg[-1] if msg else 'parec terminou'}"
+            self.current, self.error = None, f"{dev.label}: {msg[-1] if msg else 'parec exited'}"
 
     def close(self) -> None:
         proc, self.proc = self.proc, None
@@ -146,7 +146,7 @@ class AudioInput(AudioBase):
 
 
 # --------------------------------------------------------------------------- #
-# Tremor da janela do terminal (X11)
+# Terminal window shake (X11)
 # --------------------------------------------------------------------------- #
 
 
@@ -158,12 +158,12 @@ class WindowShaker:
         self.ok = False
         self.calibrated = False
         self.base = (0, 0)
-        self.delta = (0, 0)   # diferença fixa entre onde pedimos e onde o gerenciador de janelas põe
+        self.delta = (0, 0)   # fixed offset between where we ask and where the window manager puts it
         self.active = False
         self.t_move = self.t_check = 0.0
         try:
             self._connect()
-        except Exception:  # noqa: BLE001 - qualquer falha = sem tremor de janela
+        except Exception:  # noqa: BLE001 - any failure means no window shake
             self.dpy = None
 
     # ----- X11 -------------------------------------------------------------
@@ -172,7 +172,7 @@ class WindowShaker:
             return
         wayland = os.environ.get("XDG_SESSION_TYPE") == "wayland"
         win = int(os.environ["WINDOWID"], 0) if os.environ.get("WINDOWID") else 0
-        if not win and not wayland:  # no Wayland a "janela ativa" pode ser outro app
+        if not win and not wayland:  # on Wayland the "active window" may be another app
             win = self._active_window()
         if not win:
             return
@@ -187,7 +187,7 @@ class WindowShaker:
                                             ctypes.POINTER(W)]
         x.XSync.argtypes = [D, ctypes.c_int]
         x.XFlush.argtypes = [D]
-        # o handler padrão do Xlib encerra o processo se a janela não existir
+        # the default Xlib error handler kills the process if the window does not exist
         handler_t = ctypes.CFUNCTYPE(ctypes.c_int, D, D)
         self._handler = handler_t(lambda d, e: 0)
         x.XSetErrorHandler(self._handler)
@@ -212,7 +212,7 @@ class WindowShaker:
         px, py, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
         if not self.x.XTranslateCoordinates(self.dpy, self.win, self.root, 0, 0,
                                             ctypes.byref(px), ctypes.byref(py), ctypes.byref(child)):
-            raise OSError("janela inválida")
+            raise OSError("invalid window")
         return px.value, py.value
 
     def _request(self, x: int, y: int) -> None:
@@ -221,11 +221,11 @@ class WindowShaker:
 
     def _settle(self) -> tuple[int, int]:
         self.x.XSync(self.dpy, 0)
-        time.sleep(0.06)  # o gerenciador de janelas aplica o movimento de forma assíncrona
+        time.sleep(0.06)  # the window manager applies the move asynchronously
         return self._pos()
 
     def _calibrate(self) -> None:
-        """Descobre se o gerenciador de janelas deixa a janela mover e qual o desvio fixo dele."""
+        """Finds out whether the window manager lets the window move, and its fixed offset."""
         self.calibrated = True
         try:
             bx, by = self._pos()
@@ -233,14 +233,14 @@ class WindowShaker:
             p1 = self._settle()
             self._request(bx + 20, by)
             p2 = self._settle()
-            self.ok = abs((p2[0] - p1[0]) - 10) <= 2  # maximizada/tiling: o movimento é ignorado
+            self.ok = abs((p2[0] - p1[0]) - 10) <= 2  # maximized/tiling: the move is ignored
             self.delta = (p1[0] - (bx + 10), p1[1] - by)
             self._request(bx - self.delta[0], by - self.delta[1])
             self.base = self._settle()
         except OSError:
             self.ok = False
 
-    # ----- interface comum -------------------------------------------------
+    # ----- common interface ------------------------------------------------
     def usable(self) -> bool:
         if self.dpy is None:
             return False
@@ -260,7 +260,7 @@ class WindowShaker:
             self._request(self.base[0] - self.delta[0], self.base[1] - self.delta[1])
             self.active, self.t_move = False, now
         elif now - self.t_move > 0.5 and now - self.t_check > 0.5:
-            self.t_check = now  # parado: se o usuário arrastou a janela, adota a nova posição
+            self.t_check = now  # idle: if the user dragged the window, adopt the new position
             try:
                 pos = self._pos()
             except OSError:
@@ -270,12 +270,12 @@ class WindowShaker:
 
 
 # --------------------------------------------------------------------------- #
-# Terminal e teclado
+# Terminal and keyboard
 # --------------------------------------------------------------------------- #
 
 
 def setup_terminal() -> Callable[[], None] | None:
-    """Põe o terminal em modo cbreak (tecla a tecla, sem eco). Devolve a função que restaura."""
+    """Puts the terminal in cbreak mode (key by key, no echo). Returns the restore function."""
     if not sys.stdin.isatty():
         return None
     fd = sys.stdin.fileno()
@@ -299,7 +299,7 @@ def read_keys() -> list[str]:
     while i < len(text):
         ch = text[i]
         if ch == "\x1b":
-            if text[i + 1:i + 2] in ("[", "O"):  # seta/função: ESC [ params letra
+            if text[i + 1:i + 2] in ("[", "O"):  # arrow/function key: ESC [ params letter
                 j = i + 2
                 while j < len(text) and text[j] in "0123456789;":
                     j += 1

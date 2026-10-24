@@ -1,23 +1,25 @@
 # Audio Visualizer
 
-Visualizador de áudio para o terminal. As barras têm fade de cor e, quando bate um grave forte, a janela do terminal treme.
+Terminal audio visualizer. The bars have a color fade and, when a strong bass hits, the terminal window shakes.
 
 ![screenshot](docs/screenshot.png)
 
-## Uso
+## Usage
 
 ```bash
 # Windows
 pip install -r requirements.txt
 python visualizer.py
 
-# Linux (PulseAudio ou PipeWire)
+# Linux (PulseAudio or PipeWire)
 sudo apt install python3-numpy pulseaudio-utils
 python3 visualizer.py
 
-python visualizer.py --demo   # sem precisar tocar nada
+python visualizer.py --demo   # no need to play anything
 ```
 
-Teclas: `M` menu, `P` paleta, `S` tremor, `F` efeitos, `Q` sair.
+Keys: `M` menu, `P` palette, `S` shake, `F` effects, `Q` quit.
 
-No Linux a janela só treme em X11/XWayland; em Wayland puro treme só o conteúdo.
+Too sensitive? Press `Down` (or open the menu with `M`). Sensitivity goes down to x0.02.
+
+On Linux the window only shakes on X11/XWayland; on pure Wayland only the content shakes.
