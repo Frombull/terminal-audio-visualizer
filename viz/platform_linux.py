@@ -24,7 +24,7 @@ from typing import Callable
 
 import numpy as np
 
-from audio_base import AudioBase, Device
+from .audio import AudioBase, Device
 
 _ENV = {**os.environ, "LC_ALL": "C"}
 

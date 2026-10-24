@@ -1,4 +1,4 @@
-"""The part of the audio input that does not depend on the operating system."""
+"""Audio input shared by every backend, plus a synthetic demo source."""
 from __future__ import annotations
 
 import threading
@@ -6,6 +6,10 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
+
+# --------------------------------------------------------------------------- #
+# Devices and the sample ring buffer
+# --------------------------------------------------------------------------- #
 
 RING = 1 << 15
 
@@ -81,3 +85,42 @@ class AudioBase:
     @property
     def label(self) -> str:
         return self.current.label if self.current else (self.error or "no input")
+
+
+# --------------------------------------------------------------------------- #
+# Demo source
+# --------------------------------------------------------------------------- #
+
+class DemoSource:
+    """Synthetic signal (kick + hi-hat + chords) to try it without playing anything."""
+
+    rate = 48000
+    devices: list[Device] = []
+    error = ""
+    label = "Demo"
+    current = None
+
+    def __init__(self, clock=time.perf_counter) -> None:
+        self.clock = clock
+        self.t0 = clock()
+
+    def find(self, label):  # noqa: D401
+        return None
+
+    def open(self, dev) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def latest(self, n: int) -> np.ndarray:
+        t = (self.clock() - self.t0) - (n - 1 - np.arange(n)) / self.rate
+        beat = 60.0 / 124.0
+        p = t % beat
+        kick = 0.85 * np.exp(-p * 9) * np.sin(2 * np.pi * (46 * p + 3 * (1 - np.exp(-30 * p))))
+        ph = (t + beat / 4) % (beat / 2)
+        hat = np.random.randn(n) * np.exp(-ph * 70) * 0.12
+        swell = 0.55 + 0.45 * np.sin(2 * np.pi * 0.25 * t)
+        pad = swell * (0.07 * np.sin(2 * np.pi * 220 * t) + 0.06 * np.sin(2 * np.pi * 330 * t)
+                       + 0.05 * np.sin(2 * np.pi * 659 * t) + 0.03 * np.sin(2 * np.pi * 1760 * t))
+        return (kick + hat + pad).astype(np.float32)

@@ -10,7 +10,7 @@ from typing import Callable
 
 import numpy as np
 
-from audio_base import AudioBase, Device
+from .audio import AudioBase, Device
 
 try:
     import pyaudiowpatch as pyaudio
