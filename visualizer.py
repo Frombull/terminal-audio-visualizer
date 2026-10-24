@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""Visualizador de áudio para o terminal (Windows).
+
+Captura o som que está tocando no PC (loopback WASAPI) ou um microfone, mostra
+barras com fade de cor e, quando bate um grave forte, faz a janela do terminal
+tremer de verdade (e, se não der para mover a janela, treme o conteúdo).
+
+    python visualizer.py            # usa a saída padrão (o que você está ouvindo)
+    python visualizer.py --demo     # sinal sintético, sem precisar tocar nada
+    python visualizer.py --list-devices
+
+Teclas:  M = menu   ↑↓ = sensibilidade   ←→ = nº de barras   P = paleta
+         S = tremor   D = trocar entrada   Q = sair
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import math
+import os
+import random
+import sys
+import threading
+import time
+from ctypes import wintypes
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+
+if os.name != "nt":
+    sys.exit("Este visualizador usa APIs do Windows (WASAPI/msvcrt).")
+
+import msvcrt
+
+import numpy as np
+
+try:
+    import pyaudiowpatch as pyaudio
+except ImportError:  # pragma: no cover
+    sys.exit("Dependências ausentes. Rode:  pip install -r requirements.txt")
+
+SETTINGS_FILE = Path(__file__).with_name("settings.json")
+ESC = "\x1b"
+
+# --------------------------------------------------------------------------- #
+# Configurações
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Settings:
+    device: str = ""            # rótulo do dispositivo ("" = saída padrão)
+    sensitivity: float = 1.0
+    auto_gain: bool = True
+    bars: int = 48
+    smoothing: int = 5
+    palette: str = "neon"
+    style: str = "bars"         # bars | mirror
+    reflection: bool = True
+    peaks: bool = True
+    shake: str = "auto"         # auto | window | content | off
+    shake_strength: int = 5
+    bass_sensitivity: float = 1.0
+    fps: int = 60
+
+    @classmethod
+    def load(cls) -> "Settings":
+        s = cls()
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            names = {f.name for f in fields(cls)}
+            for k, v in data.items():
+                if k in names and type(v) is type(getattr(s, k)):
+                    setattr(s, k, v)
+        except (OSError, ValueError):
+            pass
+        return s
+
+    def save(self) -> None:
+        try:
+            SETTINGS_FILE.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+
+# (stops, mistura horizontal, brilho na base)
+PALETTES: dict[str, tuple[list[tuple[float, tuple[int, int, int]]], float, float]] = {
+    "neon": ([(0, (70, 30, 210)), (0.5, (255, 40, 190)), (1, (0, 235, 255))], 0.25, 0.6),
+    "fire": ([(0, (110, 0, 0)), (0.4, (255, 60, 0)), (0.75, (255, 190, 0)), (1, (255, 255, 190))], 0.0, 0.7),
+    "ocean": ([(0, (0, 25, 120)), (0.5, (0, 140, 225)), (1, (130, 255, 235))], 0.2, 0.7),
+    "sunset": ([(0, (70, 20, 130)), (0.4, (225, 50, 120)), (0.75, (255, 140, 60)), (1, (255, 235, 130))], 0.2, 0.7),
+    "matrix": ([(0, (0, 55, 20)), (0.6, (0, 205, 70)), (1, (200, 255, 210))], 0.0, 0.8),
+    "rainbow": (
+        [(0, (255, 60, 60)), (0.17, (255, 210, 40)), (0.34, (60, 255, 90)),
+         (0.5, (40, 230, 255)), (0.67, (80, 90, 255)), (0.84, (230, 60, 255)), (1, (255, 60, 120))],
+        0.85, 0.45,
+    ),
+    "ice": ([(0, (40, 60, 160)), (0.55, (120, 190, 255)), (1, (255, 255, 255))], 0.1, 0.75),
+}
+
+
+def gradient(stops, t: np.ndarray) -> np.ndarray:
+    xs = [s[0] for s in stops]
+    t = np.clip(t, 0.0, 1.0)
+    return np.stack([np.interp(t, xs, [s[1][c] for s in stops]) for c in range(3)], axis=-1)
+
+
+# --------------------------------------------------------------------------- #
+# Entrada de áudio
+# --------------------------------------------------------------------------- #
+
+RING = 1 << 15
+
+
+@dataclass
+class Device:
+    index: int
+    name: str
+    loopback: bool
+    rate: int
+    channels: int
+
+    @property
+    def label(self) -> str:
+        return ("Saída: " if self.loopback else "Mic: ") + self.name
+
+
+class AudioInput:
+    """Captura em thread própria e guarda os últimos samples (mono) num ring buffer."""
+
+    def __init__(self) -> None:
+        self.pa = pyaudio.PyAudio()
+        self.stream = None
+        self.ring = np.zeros(RING, np.float32)
+        self.widx = 0
+        self.lock = threading.Lock()
+        self.last_data = 0.0
+        self.rate = 48000
+        self.error = ""
+        self.current: Device | None = None
+        self.devices = self._enumerate()
+
+    def _enumerate(self) -> list[Device]:
+        try:
+            api = self.pa.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+        except OSError:
+            return []
+        default_loop = None
+        try:
+            default_loop = self.pa.get_default_wasapi_loopback()["index"]
+        except Exception:
+            pass
+        found = []
+        for i in range(self.pa.get_device_count()):
+            d = self.pa.get_device_info_by_index(i)
+            if d["hostApi"] != api or d["maxInputChannels"] < 1:
+                continue
+            found.append(Device(
+                index=i,
+                name=d["name"].replace(" [Loopback]", ""),
+                loopback=bool(d.get("isLoopbackDevice")),
+                rate=int(d["defaultSampleRate"]),
+                channels=int(d["maxInputChannels"]),
+            ))
+        found.sort(key=lambda dv: (dv.index != default_loop, not dv.loopback, dv.index))
+        return found
+
+    def find(self, label: str) -> Device | None:
+        for dv in self.devices:
+            if dv.label == label:
+                return dv
+        return self.devices[0] if self.devices else None
+
+    def open(self, dev: Device | None) -> None:
+        self.close()
+        if dev is None:
+            self.error = "nenhum dispositivo de entrada encontrado"
+            return
+        ch = dev.channels
+
+        def callback(data, frames, tinfo, status):
+            x = np.frombuffer(data, np.float32)
+            if ch > 1:
+                x = x.reshape(-1, ch).mean(axis=1)
+            self._push(x)
+            return (None, pyaudio.paContinue)
+
+        try:
+            self.stream = self.pa.open(
+                format=pyaudio.paFloat32, channels=ch, rate=dev.rate, input=True,
+                input_device_index=dev.index, frames_per_buffer=1024, stream_callback=callback,
+            )
+            self.rate = dev.rate
+            self.current = dev
+            self.error = ""
+        except Exception as e:  # noqa: BLE001 - mostramos o erro na UI
+            self.stream = None
+            self.current = None
+            self.error = f"{dev.label}: {e}"
+
+    def close(self) -> None:
+        if self.stream is not None:
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.stream = None
+
+    def shutdown(self) -> None:
+        self.close()
+        self.pa.terminate()
+
+    def _push(self, x: np.ndarray) -> None:
+        n = len(x)
+        with self.lock:
+            if n >= RING:
+                self.ring[:] = x[-RING:]
+                self.widx = 0
+            else:
+                end = self.widx + n
+                if end <= RING:
+                    self.ring[self.widx:end] = x
+                else:
+                    k = RING - self.widx
+                    self.ring[self.widx:] = x[:k]
+                    self.ring[:n - k] = x[k:]
+                self.widx = end % RING
+            self.last_data = time.perf_counter()
+
+    def latest(self, n: int) -> np.ndarray:
+        with self.lock:
+            # loopback não entrega callbacks quando está tudo em silêncio
+            if time.perf_counter() - self.last_data > 0.12:
+                return np.zeros(n, np.float32)
+            return self.ring.take(np.arange(self.widx - n, self.widx), mode="wrap")
+
+    @property
+    def label(self) -> str:
+        return self.current.label if self.current else (self.error or "sem entrada")
+
+
+class DemoSource:
+    """Sinal sintético (kick + chimbal + acordes) para testar sem tocar nada."""
+
+    rate = 48000
+    devices: list[Device] = []
+    error = ""
+    label = "Demo (sinal sintético)"
+    current = None
+
+    def __init__(self, clock=time.perf_counter) -> None:
+        self.clock = clock
+        self.t0 = clock()
+
+    def find(self, label):  # noqa: D401
+        return None
+
+    def open(self, dev) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def latest(self, n: int) -> np.ndarray:
+        t = (self.clock() - self.t0) - (n - 1 - np.arange(n)) / self.rate
+        beat = 60.0 / 124.0
+        p = t % beat
+        kick = 0.85 * np.exp(-p * 9) * np.sin(2 * np.pi * (46 * p + 3 * (1 - np.exp(-30 * p))))
+        ph = (t + beat / 4) % (beat / 2)
+        hat = np.random.randn(n) * np.exp(-ph * 70) * 0.12
+        swell = 0.55 + 0.45 * np.sin(2 * np.pi * 0.25 * t)
+        pad = swell * (0.07 * np.sin(2 * np.pi * 220 * t) + 0.06 * np.sin(2 * np.pi * 330 * t)
+                       + 0.05 * np.sin(2 * np.pi * 659 * t) + 0.03 * np.sin(2 * np.pi * 1760 * t))
+        return (kick + hat + pad).astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# Análise (FFT -> barras) e detecção de grave
+# --------------------------------------------------------------------------- #
+
+DB_RANGE = 50.0       # faixa dinâmica exibida
+MANUAL_REF_DB = -14.0  # referência de topo quando o ganho automático está desligado
+
+
+class Analyzer:
+    def __init__(self) -> None:
+        self.rate = 0
+        self.bars = 0
+        self.N = 4096
+        self.ref_db = -30.0
+
+    def configure(self, rate: int, bars: int) -> None:
+        self.rate, self.bars = rate, bars
+        self.N = 1 << int(round(math.log2(rate * 0.085)))
+        self.win = np.hanning(self.N).astype(np.float32)
+        self.wsum = float(self.win.sum())
+        self.freqs = np.fft.rfftfreq(self.N, 1.0 / rate)
+        bin_hz = rate / self.N
+        top = len(self.freqs) - 1
+        edges = np.geomspace(30.0, min(16000.0, rate / 2 * 0.92), bars + 1)
+        klo, khi = edges[:-1] / bin_hz, edges[1:] / bin_hz
+        s = np.minimum(np.floor(klo).astype(int), top - 1)
+        e = np.minimum(np.maximum(np.ceil(khi).astype(int), s + 1), top)
+        self.red = np.empty(2 * bars, int)
+        self.red[0::2], self.red[1::2] = s, e
+        self.narrow = (khi - klo) < 1.5
+        self.centers = np.sqrt(edges[:-1] * edges[1:])
+        self.tilt = 3.0 * np.log2(self.centers / 60.0)  # compensa a queda natural dos agudos
+        self.b0 = max(1, int(30 / bin_hz))
+        self.b1 = max(self.b0 + 2, int(150 / bin_hz))
+
+    def process(self, x: np.ndarray, sens_db: float, auto: bool, dt: float):
+        spec = np.abs(np.fft.rfft(x[-self.N:] * self.win)) * (2.0 / self.wsum)
+        vals = np.maximum.reduceat(spec, self.red)[0::2]
+        vals = np.where(self.narrow, np.interp(self.centers, self.freqs, spec), vals)
+        db = 20.0 * np.log10(vals + 1e-9) + self.tilt
+        bass_db = 20.0 * np.log10(spec[self.b0:self.b1].max() + 1e-9)
+        if auto:
+            peak = float(db.max())
+            if peak > self.ref_db:
+                self.ref_db += (peak - self.ref_db) * min(1.0, dt / 0.08)
+            else:
+                self.ref_db -= 4.0 * dt
+            self.ref_db = max(self.ref_db, -55.0)
+            ref = self.ref_db
+        else:
+            ref = MANUAL_REF_DB
+        ref -= sens_db
+        lv = np.clip((db - ref + DB_RANGE) / DB_RANGE, 0.0, 1.0)
+        bass = max(0.0, (bass_db - ref + DB_RANGE) / DB_RANGE)
+        return lv, bass
+
+
+class BarState:
+    """Suavização (ataque rápido / queda lenta) e picos flutuantes."""
+
+    def __init__(self, n: int) -> None:
+        self.v = np.zeros(n)
+        self.cap = np.zeros(n)
+        self.vel = np.zeros(n)
+        self.hold = np.zeros(n)
+
+    def update(self, target: np.ndarray, smoothing: int, dt: float) -> None:
+        if smoothing > 0 and len(target) > 2:
+            t = np.pad(target, 1, mode="edge")
+            target = 0.2 * t[:-2] + 0.6 * t[1:-1] + 0.2 * t[2:]
+        ka = 1 - math.exp(-dt / (0.002 + 0.006 * smoothing))
+        kr = 1 - math.exp(-dt / (0.02 + 0.045 * smoothing))
+        self.v += (target - self.v) * np.where(target > self.v, ka, kr)
+        up = self.v >= self.cap
+        self.cap[up] = self.v[up]
+        self.hold[up] = 0.4
+        self.vel[up] = 0.0
+        self.hold[~up] -= dt
+        fall = ~up & (self.hold <= 0)
+        self.vel[fall] += 2.2 * dt
+        self.cap[fall] = np.maximum(self.cap[fall] - self.vel[fall] * dt, self.v[fall])
+
+
+class BassTracker:
+    """Detecta pancadas de grave (energia subindo acima da média recente)."""
+
+    def __init__(self) -> None:
+        self.avg = 0.0
+        self.env = 0.0    # intensidade do tremor (0..1)
+        self.flash = 0.0  # brilho extra nas barras
+        self.level = 0.0
+
+    def update(self, bass: float, sens: float, dt: float) -> None:
+        # média rápida: só a subida brusca (ataque) fica acima dela
+        excess = bass - self.avg
+        self.avg += (bass - self.avg) * (1 - math.exp(-dt / 0.15))
+        hit = 0.0
+        if bass > 0.4 and excess > 0.06 / sens:
+            hit = min(1.0, 0.45 + 2.5 * excess)
+        self.env = max(self.env * math.exp(-dt / 0.10), hit)
+        self.flash = max(self.flash * math.exp(-dt / 0.18), hit)
+        self.level += (min(bass, 1.0) - self.level) * (1 - math.exp(-dt / 0.06))
+
+
+# --------------------------------------------------------------------------- #
+# Tremor da janela do terminal
+# --------------------------------------------------------------------------- #
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class WindowShaker:
+    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x4, 0x10
+
+    def __init__(self) -> None:
+        self.u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        try:
+            self.u.SetProcessDPIAware()
+        except Exception:  # noqa: BLE001
+            pass
+        H = wintypes.HWND
+        k.GetConsoleWindow.restype = H
+        self.u.GetWindow.restype = H
+        self.u.GetWindow.argtypes = [H, wintypes.UINT]
+        self.u.GetWindowRect.argtypes = [H, ctypes.POINTER(RECT)]
+        self.u.SetWindowPos.argtypes = [H, H, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, wintypes.UINT]
+        for fn in (self.u.IsWindowVisible, self.u.IsZoomed, self.u.IsIconic):
+            fn.argtypes = [H]
+        hwnd = k.GetConsoleWindow()
+        if hwnd:
+            owner = self.u.GetWindow(hwnd, 4)  # GW_OWNER: no Windows Terminal é a janela real
+            hwnd = owner or hwnd
+        self.hwnd = hwnd
+        self.base: tuple[int, int] | None = None
+        self.last: tuple[int, int] | None = None
+        self._checked = 0.0
+        self._ok = False
+
+    def usable(self) -> bool:
+        now = time.perf_counter()
+        if now - self._checked > 0.5:
+            self._checked = now
+            h = self.hwnd
+            self._ok = bool(h and self.u.IsWindowVisible(h) and not self.u.IsZoomed(h)
+                            and not self.u.IsIconic(h))
+        return self._ok
+
+    def _pos(self) -> tuple[int, int]:
+        r = RECT()
+        self.u.GetWindowRect(self.hwnd, ctypes.byref(r))
+        return r.left, r.top
+
+    def move(self, dx: int, dy: int) -> None:
+        cur = self._pos()
+        if self.last is None or cur != self.last:
+            self.base = cur  # primeira vez, ou o usuário arrastou a janela
+        bx, by = self.base
+        self.u.SetWindowPos(self.hwnd, None, bx + dx, by + dy, 0, 0,
+                            self.SWP_NOSIZE | self.SWP_NOZORDER | self.SWP_NOACTIVATE)
+        self.last = self._pos()
+
+    def reset(self) -> None:
+        if self.base is not None and self.last != self.base:
+            self.move(0, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Renderização
+# --------------------------------------------------------------------------- #
+
+BG = np.array([9, 9, 16])
+BG_PULSE = np.array([34, 10, 44])
+PANEL_BG = (18, 18, 30)
+CH = " ▁▂▃▄▅▆▇█"
+FLASH_LEVELS = 5
+
+
+def fg(c) -> str:
+    return f"{ESC}[38;2;{int(c[0])};{int(c[1])};{int(c[2])}m"
+
+
+def bgc(c) -> str:
+    return f"{ESC}[48;2;{int(c[0])};{int(c[1])};{int(c[2])}m"
+
+
+class Renderer:
+    def __init__(self) -> None:
+        self.key = None
+
+    def setup(self, cols: int, vis_rows: int, n: int, palette: str, style: str, reflection: bool) -> None:
+        key = (cols, vis_rows, n, palette, style, reflection)
+        if key == self.key:
+            return
+        self.key = key
+        self.cols, self.vis_rows, self.n, self.palette = cols, vis_rows, n, palette
+        if style == "mirror":
+            self.Ru = vis_rows // 2
+            self.Rl = self.Ru
+            self.top_pad = vis_rows - 2 * self.Ru
+            self.dim, self.fade = 0.88, 0.0
+        else:
+            self.Rl = max(2, vis_rows // 5) if reflection and vis_rows >= 10 else 0
+            self.Ru = vis_rows - self.Rl
+            self.top_pad = 0
+            self.dim, self.fade = 0.34, 0.7
+        unit = max(1, (cols - 4) // n)
+        self.gap = 1 if unit >= 2 else 0
+        self.bw = unit - self.gap
+        self.unit = unit
+        self.used = n * unit - self.gap
+        self.pad = (cols - self.used) // 2
+        self.luts: dict[int, tuple[list, list, str]] = {}
+
+    def _lut(self, lvl: int):
+        if lvl in self.luts:
+            return self.luts[lvl]
+        Ru, Rl, n = self.Ru, self.Rl, self.n
+        stops, hx, vf = PALETTES[self.palette]
+        xf = np.linspace(0, 1, n)[None, :]
+        d = np.concatenate((np.arange(Ru - 1, -1, -1), np.arange(Rl)))[:, None].astype(float)
+        tv = (d + 0.5) / Ru
+        col = gradient(stops, tv * (1 - hx) + xf * hx) * (vf + (1 - vf) * tv)[..., None]
+        f = lvl / (FLASH_LEVELS - 1)
+        bg = (BG + BG_PULSE * f).astype(int)
+        if Rl:
+            fade = self.dim * (1 - self.fade * np.arange(Rl) / Rl)
+            col[Ru:] = col[Ru:] * fade[:, None, None] + bg * (1 - fade)[:, None, None]
+        col = np.clip(col + (255 - col) * 0.28 * f, 0, 255).astype(int)
+        b = f"{bg[0]};{bg[1]};{bg[2]}"
+        norm = [[f"{ESC}[38;2;{r};{g};{bl};48;2;{b}m" for r, g, bl in row] for row in col.tolist()]
+        flip = [[f"{ESC}[38;2;{b};48;2;{r};{g};{bl}m" for r, g, bl in row] for row in col.tolist()]
+        out = (norm, flip, f"{ESC}[48;2;{b}m")
+        self.luts[lvl] = out
+        return out
+
+    def title_color(self, t: float):
+        stops, _, _ = PALETTES[self.palette]
+        return gradient(stops, np.array(t))
+
+    def visual(self, h: np.ndarray, caps: np.ndarray | None, flash: float, dx: int, dy: int) -> list[str]:
+        lvl = int(round(min(1.0, flash) * (FLASH_LEVELS - 1)))
+        norm, flip, bgseq = self._lut(lvl)
+        Ru, Rl, n, cols = self.Ru, self.Rl, self.n, self.cols
+        Hu = np.clip(np.rint(h * Ru * 8).astype(int), 1, Ru * 8)
+        d = np.arange(Ru - 1, -1, -1)[:, None]
+        up = np.clip(Hu[None, :] - d * 8, 0, 8)
+        if caps is not None:
+            capH = np.rint(caps * Ru * 8).astype(int)
+            dcap = np.minimum(capH // 8, Ru - 1)
+            show = (dcap * 8 >= Hu) & (capH > Hu)
+            cols_i = np.nonzero(show)[0]
+            up[Ru - 1 - dcap[cols_i], cols_i] = 9
+        parts = [up]
+        if Rl:
+            parts.append(np.clip(Hu[None, :] - np.arange(Rl)[:, None] * 8, 0, 8))
+        grid = np.vstack(parts).tolist()
+
+        blank_line = bgseq + " " * cols
+        pad = min(max(self.pad + dx, 0), cols - self.used)
+        bw, gap = self.bw, self.gap
+        lines = [blank_line] * self.top_pad
+        for r, crow in enumerate(grid):
+            if not any(crow):
+                lines.append(blank_line)
+                continue
+            flipped = r >= Ru
+            nrow, frow = norm[r], flip[r]
+            out: list[str] = []
+            blank, x = pad, pad
+            for b, c in enumerate(crow):
+                last = b == n - 1
+                if c == 0:
+                    w = bw if last else bw + gap
+                    blank += w
+                    x += w
+                    continue
+                if blank:
+                    out.append(bgseq + " " * blank)
+                    blank = 0
+                if c == 8:
+                    out.append(nrow[b] + "█" * bw)
+                elif c == 9:
+                    out.append(nrow[b] + "▁" * bw)
+                elif flipped:
+                    out.append(frow[b] + CH[8 - c] * bw)
+                else:
+                    out.append(nrow[b] + CH[c] * bw)
+                x += bw
+                if not last and gap:
+                    blank = gap
+                    x += gap
+            blank += cols - x
+            if blank > 0:
+                out.append(bgseq + " " * blank)
+            lines.append("".join(out))
+        if dy > 0:
+            lines = [blank_line] * dy + lines[:-dy]
+        elif dy < 0:
+            lines = lines[-dy:] + [blank_line] * (-dy)
+        return lines
+
+
+# --------------------------------------------------------------------------- #
+# Aplicação
+# --------------------------------------------------------------------------- #
+
+ITEMS = [
+    dict(key="device", label="Entrada de áudio", kind="device"),
+    dict(key="sensitivity", label="Sensibilidade", kind="num", lo=0.1, hi=6.0, step=0.1, fmt="x{:.1f}"),
+    dict(key="auto_gain", label="Ganho automático", kind="bool"),
+    dict(key="bars", label="Nº de barras", kind="num", lo=4, hi=256, step=2, fmt="{:d}"),
+    dict(key="smoothing", label="Movimento suave", kind="num", lo=0, hi=10, step=1, fmt="{:d}"),
+    dict(key="palette", label="Cores (fade)", kind="choice", opts=list(PALETTES)),
+    dict(key="style", label="Estilo", kind="choice", opts=["bars", "mirror"],
+         names={"bars": "Barras", "mirror": "Espelhado"}),
+    dict(key="reflection", label="Reflexo", kind="bool"),
+    dict(key="peaks", label="Picos flutuantes", kind="bool"),
+    dict(key="shake", label="Tremor da tela", kind="choice", opts=["auto", "window", "content", "off"],
+         names={"auto": "Automático", "window": "Janela", "content": "Conteúdo", "off": "Desligado"}),
+    dict(key="shake_strength", label="Força do tremor", kind="num", lo=0, hi=10, step=1, fmt="{:d}"),
+    dict(key="bass_sensitivity", label="Sensib. dos graves", kind="num", lo=0.3, hi=3.0, step=0.1, fmt="x{:.1f}"),
+    dict(key="fps", label="Quadros por segundo", kind="num", lo=15, hi=120, step=5, fmt="{:d}"),
+]
+
+HINTS = " M menu  ↑↓ sensibilidade  ←→ barras  P paleta  S tremor  D entrada  Q sair "
+MENU_HINTS = " ↑↓ item  ←→ ajusta  R restaura padrões  M/Enter/Esc fecha "
+
+
+def term_size() -> tuple[int, int]:
+    try:
+        s = os.get_terminal_size()
+        return s.columns, s.lines
+    except OSError:
+        return 100, 30
+
+
+def read_keys() -> list[str]:
+    keys = []
+    while msvcrt.kbhit():
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            keys.append({"H": "up", "P": "down", "K": "left", "M": "right"}.get(msvcrt.getwch(), ""))
+        elif ch == "\r":
+            keys.append("enter")
+        elif ch == "\t":
+            keys.append("tab")
+        elif ch == ESC:
+            keys.append("esc")
+        elif ch == "\x03":
+            keys.append("q")
+        else:
+            keys.append(ch.lower())
+    return keys
+
+
+class App:
+    def __init__(self, settings: Settings, audio) -> None:
+        self.s = settings
+        self.audio = audio
+        self.an = Analyzer()
+        self.bars = BarState(1)
+        self.bass = BassTracker()
+        self.rend = Renderer()
+        self.shaker = WindowShaker()
+        self.running = True
+        self.menu_open = False
+        self.sel = 0
+        self.toast = ("", 0.0)
+        self.dirty_at = 0.0
+        self.size = (0, 0)
+        self.fps = float(settings.fps)
+        self.shake_state = "off"
+        self.audio.open(self.audio.find(settings.device))
+
+    # ----- ajustes ---------------------------------------------------------
+    def say(self, text: str) -> None:
+        self.toast = (text, time.perf_counter() + 1.6)
+
+    def touch(self) -> None:
+        self.dirty_at = time.perf_counter()
+
+    def display(self, item) -> str:
+        k, v = item["key"], getattr(self.s, item["key"], None)
+        if item["kind"] == "device":
+            return self.audio.label
+        if item["kind"] == "bool":
+            return "ligado" if v else "desligado"
+        if item["kind"] == "choice":
+            return item.get("names", {}).get(v, v)
+        return item["fmt"].format(v)
+
+    def adjust(self, item, direction: int) -> None:
+        k, s = item["key"], self.s
+        if item["kind"] == "bool":
+            setattr(s, k, not getattr(s, k))
+        elif item["kind"] == "choice":
+            opts = item["opts"]
+            setattr(s, k, opts[(opts.index(getattr(s, k)) + direction) % len(opts)])
+        elif item["kind"] == "num":
+            v = getattr(s, k) + direction * item["step"]
+            v = min(max(v, item["lo"]), item["hi"])
+            setattr(s, k, int(round(v)) if isinstance(getattr(s, k), int) else round(v, 2))
+        elif item["kind"] == "device":
+            devs = self.audio.devices
+            if devs:
+                cur = self.audio.current
+                i = devs.index(cur) if cur in devs else -1
+                dev = devs[(i + direction) % len(devs)]
+                s.device = dev.label
+                self.audio.open(dev)
+        self.touch()
+        if item["kind"] != "device" or self.audio.devices:
+            self.say(f"{item['label']}: {self.display(item)}")
+
+    def item(self, key: str):
+        return next(i for i in ITEMS if i["key"] == key)
+
+    def handle_keys(self) -> None:
+        for k in read_keys():
+            if k == "q" or (k == "esc" and not self.menu_open):
+                self.running = False
+            elif k in ("m", "tab", "enter") or (k == "esc" and self.menu_open):
+                self.menu_open = not self.menu_open
+            elif self.menu_open:
+                if k == "up":
+                    self.sel = (self.sel - 1) % len(ITEMS)
+                elif k == "down":
+                    self.sel = (self.sel + 1) % len(ITEMS)
+                elif k in ("left", "right"):
+                    self.adjust(ITEMS[self.sel], 1 if k == "right" else -1)
+                elif k == "r":
+                    dev = self.s.device
+                    self.s.__dict__.update(asdict(Settings(device=dev)))
+                    self.touch()
+                    self.say("Padrões restaurados")
+            elif k in ("up", "+", "="):
+                self.adjust(self.item("sensitivity"), 1)
+            elif k in ("down", "-", "_"):
+                self.adjust(self.item("sensitivity"), -1)
+            elif k == "right":
+                self.adjust(self.item("bars"), 1)
+            elif k == "left":
+                self.adjust(self.item("bars"), -1)
+            elif k == "p":
+                self.adjust(self.item("palette"), 1)
+            elif k == "s":
+                self.adjust(self.item("shake"), 1)
+            elif k == "d":
+                self.adjust(self.item("device"), 1)
+
+    # ----- tremor ----------------------------------------------------------
+    def apply_shake(self) -> tuple[int, int]:
+        s, env = self.s, self.bass.env
+        amp = (env ** 1.3) * s.shake_strength / 10.0 if s.shake != "off" else 0.0
+        use_window = s.shake in ("auto", "window") and self.shaker.usable()
+        self.shake_state = "janela" if use_window else (
+            "conteúdo" if s.shake in ("auto", "content") else ("sem janela" if s.shake == "window" else "off"))
+        if use_window:
+            if amp > 0.02:
+                px = amp * 40
+                self.shaker.move(round(random.uniform(-1, 1) * px), round(random.uniform(-1, 1) * px * 0.7))
+            else:
+                self.shaker.reset()
+            return 0, 0
+        self.shaker.reset()
+        if s.shake in ("auto", "content") and amp > 0.04:
+            return round(random.uniform(-1, 1) * amp * 2.5), round(random.uniform(-1, 1) * amp * 1.4)
+        return 0, 0
+
+    # ----- desenho ---------------------------------------------------------
+    def title_bar(self, cols: int) -> str:
+        title = " ♪ AUDIO VISUALIZER"
+        left = "".join(fg(self.rend.title_color(i / (len(title) - 1))) + ch for i, ch in enumerate(title))
+        meter_n = 10
+        filled = int(round(min(1.0, self.bass.level) * meter_n))
+        right = f"graves {'▮' * filled}{'▯' * (meter_n - filled)}  {self.fps:3.0f} fps  tremor: {self.shake_state} "
+        room = cols - len(title) - len(right) - 3
+        dev = self.audio.label
+        dev = dev if len(dev) <= room else dev[:max(0, room - 1)] + "…"
+        gap = max(0, room - len(dev))
+        return (bgc(PANEL_BG) + left + fg((120, 120, 150)) + "  " + dev + " " * (gap + 1)
+                + fg((170, 170, 200)) + right + " " * 0)
+
+    def bottom_bar(self, cols: int) -> str:
+        text, until = self.toast
+        if text and time.perf_counter() < until:
+            text, color = f" {text}", (255, 255, 255)
+        else:
+            text, color = (MENU_HINTS if self.menu_open else HINTS), (120, 120, 150)
+        return bgc(PANEL_BG) + fg(color) + text[:cols].ljust(cols)
+
+    def menu_lines(self, cols: int, avail: int) -> list[str]:
+        n_vis = min(len(ITEMS), avail)
+        top = min(max(0, self.sel - n_vis // 2), len(ITEMS) - n_vis)
+        accent = self.rend.title_color(0.5)
+        out = []
+        for i in range(top, top + n_vis):
+            it = ITEMS[i]
+            val = self.display(it)
+            if it["kind"] == "num":
+                frac = (getattr(self.s, it["key"]) - it["lo"]) / (it["hi"] - it["lo"])
+                f = int(round(frac * 12))
+                val = "█" * f + "░" * (12 - f) + "  " + val
+            selected = i == self.sel
+            text = f" {'▶' if selected else ' '} {it['label']:<20}{'◀ ' if selected else '  '}{val}{' ▶' if selected else ''}"
+            text = text[:cols].ljust(cols)
+            if selected:
+                out.append(bgc(tuple(c * 0.35 for c in accent)) + fg((255, 255, 255)) + text)
+            else:
+                out.append(bgc(PANEL_BG) + fg((170, 170, 200)) + text)
+        return out
+
+    def menu_height(self, rows: int) -> int:
+        return min(len(ITEMS), max(3, rows - 2 - 8))
+
+    def draw(self, cols: int, rows: int, n: int, dx: int, dy: int) -> str:
+        s = self.s
+        menu_h = self.menu_height(rows) if self.menu_open else 0
+        vis_rows = max(4, rows - 2 - menu_h)
+        self.rend.setup(cols, vis_rows, n, s.palette, s.style, s.reflection)
+        vis = self.rend.visual(self.bars.v, self.bars.cap if s.peaks and s.style == "bars" else None,
+                               self.bass.flash, dx, dy)
+        lines = [self.title_bar(cols)] + vis
+        if self.menu_open:
+            lines += self.menu_lines(cols, menu_h)
+        lines.append(self.bottom_bar(cols))
+        body = "".join(f"{ESC}[{i};1H{ln}" for i, ln in enumerate(lines, 1))
+        return f"{ESC}[?2026h{body}{ESC}[0m{ESC}[?2026l"
+
+    # ----- loop principal --------------------------------------------------
+    def run(self) -> None:
+        out = sys.stdout
+        last = time.perf_counter()
+        while self.running:
+            now = time.perf_counter()
+            dt = min(max(now - last, 1e-3), 0.1)
+            last = now
+            self.fps += (1.0 / dt - self.fps) * 0.1
+            self.handle_keys()
+            if self.dirty_at and now - self.dirty_at > 1.0:
+                self.s.save()
+                self.dirty_at = 0.0
+
+            cols, rows = term_size()
+            if (cols, rows) != self.size:
+                self.size = (cols, rows)
+                out.write(f"{ESC}[0m{ESC}[2J")
+            if cols < 30 or rows < 10:
+                out.write(f"{ESC}[2J{ESC}[Hterminal pequeno demais")
+                out.flush()
+                time.sleep(0.1)
+                continue
+
+            n = max(4, min(self.s.bars, cols - 4))
+            if self.an.rate != self.audio.rate or self.an.bars != n:
+                if self.an.bars != n:
+                    self.bars = BarState(n)
+                self.an.configure(self.audio.rate, n)
+            lv, bass = self.an.process(self.audio.latest(self.an.N),
+                                       20 * math.log10(self.s.sensitivity), self.s.auto_gain, dt)
+            self.bars.update(lv, self.s.smoothing, dt)
+            self.bass.update(bass, self.s.bass_sensitivity, dt)
+            dx, dy = self.apply_shake()
+
+            out.write(self.draw(cols, rows, n, dx, dy))
+            out.flush()
+            spare = 1.0 / self.s.fps - (time.perf_counter() - now)
+            if spare > 0:
+                time.sleep(spare)
+
+
+# --------------------------------------------------------------------------- #
+# Terminal / entrada do programa
+# --------------------------------------------------------------------------- #
+
+
+def enable_vt() -> bool:
+    k = ctypes.windll.kernel32
+    h = k.GetStdHandle(-11)
+    mode = wintypes.DWORD()
+    if not k.GetConsoleMode(h, ctypes.byref(mode)):
+        return False
+    return bool(k.SetConsoleMode(h, mode.value | 0x0004))  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Visualizador de áudio para o terminal")
+    ap.add_argument("--demo", action="store_true", help="usa um sinal sintético em vez de captura")
+    ap.add_argument("--list-devices", action="store_true", help="lista as entradas disponíveis")
+    ap.add_argument("--device", help="trecho do nome da entrada (ex.: 'Edifier' ou 'Mic')")
+    ap.add_argument("--reset", action="store_true", help="ignora as configurações salvas")
+    args = ap.parse_args()
+
+    settings = Settings() if args.reset else Settings.load()
+    audio = DemoSource() if args.demo else AudioInput()
+
+    if args.list_devices:
+        for dv in audio.devices:
+            print(f"{dv.label}  ({dv.rate} Hz, {dv.channels} canais)")
+        audio.shutdown()
+        return
+    if args.device and audio.devices:
+        match = next((d for d in audio.devices if args.device.lower() in d.label.lower()), None)
+        if match:
+            settings.device = match.label
+
+    if not sys.stdout.isatty() or not enable_vt():
+        audio.shutdown()
+        sys.exit("Rode dentro de um terminal (de preferência o Windows Terminal).")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    app = App(settings, audio)
+    sys.stdout.write(f"{ESC}[?1049h{ESC}[?25l{ESC}[2J")
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.shaker.reset()
+        settings.save()
+        audio.shutdown()
+        sys.stdout.write(f"{ESC}[0m{ESC}[?25h{ESC}[?1049l")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
