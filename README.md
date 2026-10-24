@@ -26,6 +26,7 @@ microfone nem de "Stereo Mix". Também dá para escolher um microfone.
 | `←` `→` | nº de barras (ou ajusta o item no menu) |
 | `P` | próxima paleta de cores |
 | `S` | modo do tremor |
+| `F` | efeitos cósmicos (tudo / só estrelas / só faíscas / desligado) |
 | `D` | próxima entrada de áudio |
 | `R` (no menu) | restaura os padrões |
 | `Q` / `Esc` | sair |
@@ -37,6 +38,17 @@ Entrada de áudio, sensibilidade, ganho automático, nº de barras, movimento su
 matrix, rainbow, ice), estilo (barras ou espelhado), reflexo, picos flutuantes,
 tremor (automático / janela / conteúdo / desligado), força do tremor,
 sensibilidade dos graves e FPS. Tudo é salvo em `settings.json`.
+
+## Efeitos cósmicos
+
+Uma camada em braille (2×4 pontos por célula, bem mais fina que os blocos das
+barras) desenhada atrás das barras:
+
+- **Estrelas em warp**: flutuam devagar; quanto mais alto o som, mais rápido
+  passam, e a cada pancada de grave entram em hiperespaço com riscos de velocidade.
+- **Faíscas**: a cada kick saem do topo das barras mais altas, com gravidade e
+  na cor da paleta.
+- **Ondas de choque**: anéis que se expandem do chão nos graves mais fortes.
 
 ## Tremor
 

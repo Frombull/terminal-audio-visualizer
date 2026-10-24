@@ -58,6 +58,7 @@ class Settings:
     style: str = "bars"         # bars | mirror
     reflection: bool = True
     peaks: bool = True
+    fx: str = "all"             # all | stars | bursts | off
     shake: str = "auto"         # auto | window | content | off
     shake_strength: int = 5
     bass_sensitivity: float = 1.0
@@ -465,6 +466,124 @@ def bgc(c) -> str:
     return f"{ESC}[48;2;{int(c[0])};{int(c[1])};{int(c[2])}m"
 
 
+BIT = np.array([[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]], np.uint8)  # [dx][dy] -> ponto braille
+
+
+class Cosmos:
+    """Camada de efeitos em braille (2x4 pontos por célula): estrelas em warp,
+    faíscas que saem das barras e ondas de choque a cada pancada de grave."""
+
+    GRAVITY = 140.0  # pontos/s²
+
+    def __init__(self) -> None:
+        self.rng = np.random.default_rng()
+        self.C = self.R = self.W = self.H = 0
+        self.aspect = 2.0
+        self.x = self.y = self.z = np.zeros(0)
+        self.warp = 0.0
+        self.sparks = np.zeros((0, 7))  # x, y, vx, vy, idade, vida, posição na paleta
+        self.rings: list[list[float]] = []  # [idade 0..1, força]
+        self.last_spawn = 0.0
+
+    def _spawn_stars(self, k: int, anywhere: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        z = self.rng.uniform(0.05, 1.0, k) if anywhere else self.rng.uniform(0.7, 1.0, k)
+        x = self.rng.uniform(-1, 1, k) * self.aspect * 0.95 * z
+        y = self.rng.uniform(-1, 1, k) * 0.95 * z
+        return x, y, z
+
+    def resize(self, C: int, R: int) -> None:
+        if (C, R) == (self.C, self.R):
+            return
+        self.C, self.R, self.W, self.H = C, R, C * 2, R * 4
+        self.aspect = self.W / self.H
+        n = int(np.clip(self.W * self.H / 140, 40, 700))
+        if n > len(self.z):
+            x, y, z = self._spawn_stars(n - len(self.z), True)
+            self.x, self.y, self.z = np.append(self.x, x), np.append(self.y, y), np.append(self.z, z)
+        else:
+            self.x, self.y, self.z = self.x[:n], self.y[:n], self.z[:n]
+        self.sparks = np.zeros((0, 7))
+
+    def update(self, dt: float, env: float, energy: float) -> None:
+        self.warp = max(self.warp * math.exp(-dt / 0.35), env)
+        self.z -= (0.05 + 0.25 * energy + 1.9 * self.warp ** 1.5) * dt
+        gone = ((self.z < 0.04) | (np.abs(self.x / self.z) > self.aspect * 1.05)
+                | (np.abs(self.y / self.z) > 1.05))
+        k = int(gone.sum())
+        if k:
+            self.x[gone], self.y[gone], self.z[gone] = self._spawn_stars(k, False)
+        if len(self.sparks):
+            s = self.sparks
+            s[:, 4] += dt
+            s[:, 3] += self.GRAVITY * dt
+            s[:, 0] += s[:, 2] * dt
+            s[:, 1] += s[:, 3] * dt
+            self.sparks = s[s[:, 4] < s[:, 5]]
+        self.rings = [[a + dt / 0.9, st] for a, st in self.rings if a + dt / 0.9 < 1.0]
+
+    def burst(self, xs: np.ndarray, ys: np.ndarray, ts: np.ndarray, strength: float, ring: bool) -> None:
+        w = ts ** 2 + 1e-6
+        k = int(14 + 46 * strength)
+        idx = self.rng.choice(len(xs), k, p=w / w.sum())
+        a = np.zeros((k, 7))
+        a[:, 0] = xs[idx] + self.rng.uniform(-1, 1, k) * 2
+        a[:, 1] = ys[idx]
+        a[:, 2] = self.rng.normal(0, 28, k)
+        a[:, 3] = -self.rng.uniform(40, 120, k) * (0.6 + 0.6 * strength)
+        a[:, 5] = self.rng.uniform(0.6, 1.3, k)
+        a[:, 6] = ts[idx]
+        self.sparks = np.vstack((self.sparks, a))[-600:]
+        if ring:
+            self.rings = (self.rings + [[0.0, strength]])[-4:]
+
+    def _plot(self, bits, col, px, py, rgb) -> None:
+        ok = (px >= 0) & (px < self.W) & (py >= 0) & (py < self.H)
+        px, py, rgb = px[ok], py[ok], rgb[ok]
+        cy, cx = py >> 2, px >> 1
+        np.bitwise_or.at(bits, (cy, cx), BIT[px & 1, py & 3])
+        for c in range(3):
+            np.maximum.at(col[:, :, c], (cy, cx), rgb[:, c])
+
+    def render(self, palette: str, flash: float, stars_on: bool, bursts_on: bool,
+               axis_y: float, mirror: bool) -> dict[int, list[tuple[int, str, str]]]:
+        W, H = self.W, self.H
+        bits = np.zeros((self.R, self.C), np.uint8)
+        col = np.zeros((self.R, self.C, 3))
+        stops = PALETTES[palette][0]
+        top = gradient(stops, np.array(0.9))
+        if stars_on and len(self.z):
+            f = np.linspace(0, 1, 5)[:, None]
+            zt = self.z + 0.004 + 0.075 * self.warp  # cauda do risco: mais longe = mais perto do centro
+            zz = self.z[None, :] + (zt - self.z)[None, :] * f
+            px = np.floor(W / 2 + self.x[None, :] / zz * (H / 2)).astype(int)
+            py = np.floor(H / 2 + self.y[None, :] / zz * (H / 2)).astype(int)
+            b = ((1 - self.z) ** 0.8 * 0.8 + 0.2)[None, :] * (1 - 0.65 * f) * (0.55 + 0.45 * min(flash, 1.0))
+            tint = top * 0.5 + 255 * 0.5
+            self._plot(bits, col, px.ravel(), py.ravel(), (b[..., None] * tint).reshape(-1, 3))
+        if bursts_on:
+            s = self.sparks
+            if len(s):
+                a = (s[:, 4] / s[:, 5])[:, None]
+                base = gradient(stops, s[:, 6])
+                rgb = (base + (255 - base) * (1 - a) * 0.6) * (1 - a) ** 0.8
+                for back in (0.0, 0.03):
+                    self._plot(bits, col, np.floor(s[:, 0] - s[:, 2] * back).astype(int),
+                               np.floor(s[:, 1] - s[:, 3] * back).astype(int), rgb)
+            for age, st in self.rings:
+                r = (1 - (1 - age) ** 2) * W * 0.5
+                m = int(np.clip(r * 1.6, 24, 600))
+                th = np.linspace(0 if mirror else math.pi, 2 * math.pi, m)
+                inten = (1 - age) ** 1.6 * (0.45 + 0.55 * st)
+                rgb = np.tile((top * 0.4 + 255 * 0.6) * inten, (m, 1))
+                self._plot(bits, col, np.floor(W / 2 + r * np.cos(th)).astype(int),
+                           np.floor(axis_y + r * np.sin(th) * 0.85).astype(int), rgb)
+        fx: dict[int, list[tuple[int, str, str]]] = {}
+        for r, c in np.argwhere(bits > 0).tolist():
+            cr, cg, cb = np.clip(col[r, c], 0, 255).astype(int).tolist()
+            fx.setdefault(r, []).append((c, chr(0x2800 + int(bits[r, c])), f"{ESC}[38;2;{cr};{cg};{cb}m"))
+        return fx
+
+
 class Renderer:
     def __init__(self) -> None:
         self.key = None
@@ -519,7 +638,9 @@ class Renderer:
         stops, _, _ = PALETTES[self.palette]
         return gradient(stops, np.array(t))
 
-    def visual(self, h: np.ndarray, caps: np.ndarray | None, flash: float, dx: int, dy: int) -> list[str]:
+    def visual(self, h: np.ndarray, caps: np.ndarray | None, flash: float, dx: int, dy: int,
+               fx: dict[int, list[tuple[int, str, str]]] | None = None) -> list[str]:
+        fx = fx or {}
         lvl = int(round(min(1.0, flash) * (FLASH_LEVELS - 1)))
         norm, flip, bgseq = self._lut(lvl)
         Ru, Rl, n, cols = self.Ru, self.Rl, self.n, self.cols
@@ -540,14 +661,36 @@ class Renderer:
         blank_line = bgseq + " " * cols
         pad = min(max(self.pad + dx, 0), cols - self.used)
         bw, gap = self.bw, self.gap
-        lines = [blank_line] * self.top_pad
-        for r, crow in enumerate(grid):
+
+        def blank_run(out: list[str], li: int, x0: int, w: int) -> None:
+            """Espaço vazio de [x0, x0+w) na linha li, com os pontos de efeito por cima."""
+            cur, end = x0, x0 + w
+            for c, glyph, seq in fx.get(li, ()):
+                if c < cur or c >= end:
+                    continue
+                if c > cur:
+                    out.append(bgseq + " " * (c - cur))
+                out.append(seq + bgseq + glyph)
+                cur = c + 1
+            if cur < end:
+                out.append(bgseq + " " * (end - cur))
+
+        zero = [0] * n
+        lines = []
+        for li in range(self.vis_rows):
+            r = li - self.top_pad
+            crow = grid[r] if r >= 0 else zero
             if not any(crow):
-                lines.append(blank_line)
+                if li in fx:
+                    out = []
+                    blank_run(out, li, 0, cols)
+                    lines.append("".join(out))
+                else:
+                    lines.append(blank_line)
                 continue
             flipped = r >= Ru
             nrow, frow = norm[r], flip[r]
-            out: list[str] = []
+            out = []
             blank, x = pad, pad
             for b, c in enumerate(crow):
                 last = b == n - 1
@@ -557,7 +700,7 @@ class Renderer:
                     x += w
                     continue
                 if blank:
-                    out.append(bgseq + " " * blank)
+                    blank_run(out, li, x - blank, blank)
                     blank = 0
                 if c == 8:
                     out.append(nrow[b] + "█" * bw)
@@ -573,7 +716,7 @@ class Renderer:
                     x += gap
             blank += cols - x
             if blank > 0:
-                out.append(bgseq + " " * blank)
+                blank_run(out, li, cols - blank, blank)
             lines.append("".join(out))
         if dy > 0:
             lines = [blank_line] * dy + lines[:-dy]
@@ -597,6 +740,8 @@ ITEMS = [
          names={"bars": "Barras", "mirror": "Espelhado"}),
     dict(key="reflection", label="Reflexo", kind="bool"),
     dict(key="peaks", label="Picos flutuantes", kind="bool"),
+    dict(key="fx", label="Efeitos cósmicos", kind="choice", opts=["all", "stars", "bursts", "off"],
+         names={"all": "Tudo", "stars": "Só estrelas", "bursts": "Só faíscas/ondas", "off": "Desligado"}),
     dict(key="shake", label="Tremor da tela", kind="choice", opts=["auto", "window", "content", "off"],
          names={"auto": "Automático", "window": "Janela", "content": "Conteúdo", "off": "Desligado"}),
     dict(key="shake_strength", label="Força do tremor", kind="num", lo=0, hi=10, step=1, fmt="{:d}"),
@@ -604,7 +749,7 @@ ITEMS = [
     dict(key="fps", label="Quadros por segundo", kind="num", lo=15, hi=120, step=5, fmt="{:d}"),
 ]
 
-HINTS = " M menu  ↑↓ sensibilidade  ←→ barras  P paleta  S tremor  D entrada  Q sair "
+HINTS = " M menu  ↑↓ sensibilidade  ←→ barras  P paleta  S tremor  F efeitos  D entrada  Q sair "
 MENU_HINTS = " ↑↓ item  ←→ ajusta  R restaura padrões  M/Enter/Esc fecha "
 
 
@@ -643,6 +788,8 @@ class App:
         self.bars = BarState(1)
         self.bass = BassTracker()
         self.rend = Renderer()
+        self.cosmos = Cosmos()
+        self.prev_env = 0.0
         self.shaker = WindowShaker()
         self.running = True
         self.menu_open = False
@@ -727,6 +874,8 @@ class App:
                 self.adjust(self.item("palette"), 1)
             elif k == "s":
                 self.adjust(self.item("shake"), 1)
+            elif k == "f":
+                self.adjust(self.item("fx"), 1)
             elif k == "d":
                 self.adjust(self.item("device"), 1)
 
@@ -757,8 +906,11 @@ class App:
         filled = int(round(min(1.0, self.bass.level) * meter_n))
         right = f"graves {'▮' * filled}{'▯' * (meter_n - filled)}  {self.fps:3.0f} fps  tremor: {self.shake_state} "
         room = cols - len(title) - len(right) - 3
+        if room < 8:  # terminal estreito: só o essencial
+            right = f"{self.fps:3.0f} fps "
+            room = max(0, cols - len(title) - len(right) - 3)
         dev = self.audio.label
-        dev = dev if len(dev) <= room else dev[:max(0, room - 1)] + "…"
+        dev = dev if len(dev) <= room else (dev[:room - 1] + "…" if room > 0 else "")
         gap = max(0, room - len(dev))
         return (bgc(PANEL_BG) + left + fg((120, 120, 150)) + "  " + dev + " " * (gap + 1)
                 + fg((170, 170, 200)) + right + " " * 0)
@@ -795,13 +947,31 @@ class App:
     def menu_height(self, rows: int) -> int:
         return min(len(ITEMS), max(3, rows - 2 - 8))
 
-    def draw(self, cols: int, rows: int, n: int, dx: int, dy: int) -> str:
+    def fx_frame(self, dt: float):
+        """Avança e desenha a camada cósmica; dispara faíscas/ondas nas pancadas de grave."""
+        mode, c, r, env = self.s.fx, self.cosmos, self.rend, self.bass.env
+        if mode == "off":
+            return None
+        c.resize(r.cols, r.vis_rows)
+        c.update(dt, env, float(self.bars.v.mean()))
+        now = time.perf_counter()
+        if mode in ("all", "bursts") and env - self.prev_env > 0.25 and now - c.last_spawn > 0.12 \
+                and self.bars.v.max() > 0.15:
+            c.last_spawn = now
+            xs = (r.pad + np.arange(r.n) * r.unit + r.bw / 2) * 2
+            ys = (r.top_pad + r.Ru * (1 - self.bars.v)) * 4
+            c.burst(xs, ys, np.clip(self.bars.v, 0, 1), env, ring=env > 0.6)
+        self.prev_env = env
+        return c.render(self.s.palette, self.bass.flash, mode in ("all", "stars"), mode in ("all", "bursts"),
+                        (r.top_pad + r.Ru) * 4, self.s.style == "mirror")
+
+    def draw(self, cols: int, rows: int, n: int, dx: int, dy: int, dt: float) -> str:
         s = self.s
         menu_h = self.menu_height(rows) if self.menu_open else 0
         vis_rows = max(4, rows - 2 - menu_h)
         self.rend.setup(cols, vis_rows, n, s.palette, s.style, s.reflection)
         vis = self.rend.visual(self.bars.v, self.bars.cap if s.peaks and s.style == "bars" else None,
-                               self.bass.flash, dx, dy)
+                               self.bass.flash, dx, dy, self.fx_frame(dt))
         lines = [self.title_bar(cols)] + vis
         if self.menu_open:
             lines += self.menu_lines(cols, menu_h)
@@ -844,7 +1014,7 @@ class App:
             self.bass.update(bass, self.s.bass_sensitivity, dt)
             dx, dy = self.apply_shake()
 
-            out.write(self.draw(cols, rows, n, dx, dy))
+            out.write(self.draw(cols, rows, n, dx, dy, dt))
             out.flush()
             spare = 1.0 / self.s.fps - (time.perf_counter() - now)
             if spare > 0:
