@@ -1,2 +1,2 @@
 numpy>=1.26
-PyAudioWPatch>=0.2.12
+PyAudioWPatch>=0.2.12; sys_platform == "win32"
